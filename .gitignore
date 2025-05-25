@@ -1,0 +1,14 @@
+# Directories to ignore
+data/
+ipynb/
+logs/
+responder6_cnn_saved_model/
+
+# Files to ignore
+*.h5
+*.out
+*.csv
+*.png
+__pycache__/
+*.pyc
+.DS_Store 
