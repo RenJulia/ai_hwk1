@@ -8,7 +8,6 @@ responder6_cnn_saved_model/
 *.h5
 *.out
 *.csv
-*.png
 __pycache__/
 *.pyc
 .DS_Store 

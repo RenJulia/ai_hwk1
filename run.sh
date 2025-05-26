@@ -12,33 +12,20 @@
 
 # 切换到工作目录
 cd /share/home/jyren/ai_hwk1_janestreet
+module purge
+# 激活 Conda 环境（含 TF 2.12.0）
+source activate tf2-gpu
 
-# 加载必要的环境模块
+# 首先加载Anaconda并激活Conda环境
 module load anaconda/2023.09
-module load cuda/11.8  # 显式加载 CUDA 11.8
+module load cuda/11.8      
+module load tensorflow-gpu/2.12   
+module load cudnn/8.9.7.29-cuda11  
 
-# 设置 Conda 环境
-export CONDA_ENVS_PATH=/share/home/jyren/.conda/envs
-export PATH=/share/home/jyren/.conda/bin:$PATH
 
-# 设置 CUDA 环境变量
-export CUDA_HOME=/usr/local/cuda-11.8
-export PATH=$CUDA_HOME/bin:$PATH
 
-# 设置 CUDA 库路径
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/extras/CUPTI/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
-
-# 设置 TensorFlow GPU 配置
-export TF_FORCE_GPU_ALLOW_GROWTH=true
-export TF_GPU_ALLOCATOR=cuda_malloc_async
-export TF_CPP_MIN_LOG_LEVEL=2  # 屏蔽无关日志
-export CUDA_VISIBLE_DEVICES=0  # 明确指定 GPU 0（避免冲突）
-
-# 激活 Conda 环境
-source ~/.bashrc
-conda activate tf2-gpu
+# 修复Python路径，确保Conda环境的优先级
+export PYTHONPATH="$(conda info --base)/envs/tf2-gpu/lib/python3.9/site-packages:$PYTHONPATH"
 # 检查 GPU 和 CUDA 状态
 echo "=== nvidia-smi ==="
 nvidia-smi

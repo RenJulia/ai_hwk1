@@ -269,3 +269,85 @@ plt.close()
 print("MSE:", mean_squared_error(y_true, y_pred))
 print("MAE:", mean_absolute_error(y_true, y_pred))
 print("R2 Score:", r2_score(y_true, y_pred)) 
+
+# 可视化训练过程
+print("[INFO] Visualizing training process...")
+
+# 1. 训练过程中的loss下降
+plt.figure(figsize=(12, 4))
+
+# 目标值预测的loss
+plt.subplot(1, 2, 1)
+plt.plot(history.history['target_output_loss'], label='Training Loss')
+plt.plot(history.history['val_target_output_loss'], label='Validation Loss')
+plt.title('Target Prediction Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+# 噪音预测的loss
+plt.subplot(1, 2, 2)
+plt.plot(history.history['noise_output_loss'], label='Training Loss')
+plt.plot(history.history['val_noise_output_loss'], label='Validation Loss')
+plt.title('Noise Prediction Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("training_loss.png")
+plt.close()
+
+# 2. 噪音预测效果
+plt.figure(figsize=(12, 4))
+
+# 噪音预测的准确率
+plt.subplot(1, 2, 1)
+plt.plot(history.history['noise_output_accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_noise_output_accuracy'], label='Validation Accuracy')
+plt.title('Noise Prediction Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# 噪音预测的混淆矩阵
+plt.subplot(1, 2, 2)
+noise_pred_binary = (noise_pred > 0.5).astype(int)
+noise_true = noise_test.flatten()
+plt.scatter(noise_true, noise_pred.flatten(), alpha=0.3)
+plt.xlabel('True Noise Label')
+plt.ylabel('Predicted Noise Probability')
+plt.title('Noise Prediction Distribution')
+plt.plot([0, 1], [0.5, 0.5], 'r--', label='Decision Boundary')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("noise_prediction.png")
+plt.close()
+
+# 3. 目标值预测的MAE和MSE
+plt.figure(figsize=(12, 4))
+
+# MAE
+plt.subplot(1, 2, 1)
+plt.plot(history.history['target_output_mae'], label='Training MAE')
+plt.plot(history.history['val_target_output_mae'], label='Validation MAE')
+plt.title('Target Prediction MAE')
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.legend()
+
+# MSE
+plt.subplot(1, 2, 2)
+plt.plot(history.history['target_output_mse'], label='Training MSE')
+plt.plot(history.history['val_target_output_mse'], label='Validation MSE')
+plt.title('Target Prediction MSE')
+plt.xlabel('Epoch')
+plt.ylabel('MSE')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig("target_metrics.png")
+plt.close()
+
+print("✅ Training visualization completed") 
