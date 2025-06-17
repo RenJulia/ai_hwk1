@@ -1,353 +1,240 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, TensorBoard
-import tensorflow as tf
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import xgboost as xgb
 import time
 from datetime import datetime
 import os
-from tensorflow.keras.models import load_model
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import seaborn as sns
 
-
-# 0. 详细的GPU检测和配置
-print("[INFO] TensorFlow version:", tf.__version__)
-print("[INFO] CUDA available:", tf.test.is_built_with_cuda())
-print("[INFO] GPU devices:", tf.config.list_physical_devices('GPU'))
-
-# 尝试启用GPU内存增长
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("[INFO] Memory growth enabled for GPU.")
-    except RuntimeError as e:
-        print("[WARN] Error setting memory growth:", e)
-else:
-    print("[WARN] No GPU detected! Training will be on CPU.")
-    print("[INFO] Please check:")
-    print("1. NVIDIA drivers are installed (nvidia-smi)")
-    print("2. CUDA toolkit is installed (nvcc --version)")
-    print("3. cuDNN is installed")
-    print("4. tensorflow-gpu is installed (pip install tensorflow-gpu==2.12.0)")
+# 0. 设置随机种子
+np.random.seed(42)
 
 # 1. 数据路径
 DATA_PATH = "/share/home/jyren/ai_hwk1_janestreet/data/train.parquet/"
 FEATURES_PATH = "/share/home/jyren/ai_hwk1_janestreet/data/features.csv"
 
-# 2. 读取数据
-print("[INFO] Loading data...")
-df = pd.read_parquet(DATA_PATH)
-features = pd.read_csv(FEATURES_PATH)['feature'].tolist()  # features.csv 应有 'feature' 列
+def reduce_mem_usage(df):
+    """减少内存使用"""
+    for col in df.columns:
+        col_type = df[col].dtype
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    return df
 
-# 3. 缺失值处理
-print("[INFO] Handling missing values...")
-missing_percentage = df[features].isnull().sum() * 100 / len(df)
-# 剔除高缺失特征（如 >15%）
-drop_features = missing_percentage[missing_percentage > 15].index.tolist()
-features = [f for f in features if f not in drop_features]
-# 低缺失特征用中位数填充
-df[features] = df[features].fillna(df[features].median())
+def load_and_preprocess_data(data_path, features_path, target_col='responder_6'):
+    """加载和预处理数据"""
+    print("[INFO] Loading data...")
+    # 读取数据
+    df = pd.read_parquet(data_path)
+    features = pd.read_csv(features_path)['feature'].tolist()
+    
+    # 选择特征列
+    selected_columns = ['date_id', 'symbol_id', 'time_id', 'weight'] + features + [target_col]
+    df = df[selected_columns]
+    
+    # 减少内存使用
+    df = reduce_mem_usage(df)
+    
+    print("[INFO] Handling missing values...")
+    # 处理缺失值
+    for col in features:
+        if df[col].isna().any():
+            # 先按symbol_id进行前向填充
+            df[col] = df.groupby("symbol_id")[col].ffill()
+            # 对剩余的缺失值使用中位数填充
+            df[col] = df.groupby("symbol_id")[col].transform(lambda x: x.fillna(x.median()))
+    
+    print("[INFO] Applying normalization...")
+    # 特征标准化
+    df[features] = df[features].astype("float32")
+    mean = df[features].mean()
+    std = df[features].std() + 1e-5
+    df[features] = (df[features] - mean) / std
+    
+    # 添加噪声标签
+    df["is_noise"] = (df[features].abs() > 4.5).any(axis=1).astype(int)
+    
+    # 按时间划分训练集和验证集
+    dates = sorted(df["date_id"].unique())
+    train_dates = dates[:-5]  # 使用最后5天作为验证集
+    valid_dates = dates[-5:]
+    
+    train_df = df[df["date_id"].isin(train_dates)]
+    valid_df = df[df["date_id"].isin(valid_dates)]
+    
+    # 准备训练数据
+    X_train = train_df[features]
+    y_train = train_df[target_col]
+    X_valid = valid_df[features]
+    y_valid = valid_df[target_col]
+    
+    return X_train, X_valid, y_train, y_valid, features
 
-# 4. 噪声标注（滑动窗口局部std）
-print("[INFO] Calculating noise labels...")
-window_size = 20  # 可调整
-std_threshold = 3  # 3倍全局std
-noise_label = np.zeros(len(df), dtype=np.int8)
-global_std = df[features].stack().std()
-for col in features:
-    rolling_std = df[col].rolling(window=window_size, min_periods=1, center=True).std()
-    noise_label[(rolling_std > std_threshold * global_std).values] = 1
-# 可选：将噪声标签加入df
-df['noise_label'] = noise_label
+def asymmetric_weight(y_true):
+    """动态加权机制"""
+    weights = np.ones_like(y_true)
+    # 普通下跌样本
+    downside_mask = y_true < 0
+    weights[downside_mask] = 2.5
+    # 极端下跌样本（底部10%分位数）
+    extreme_down = y_true < np.percentile(y_true[y_true<0], 10)
+    weights[extreme_down] = 4.0
+    return weights
 
-# 5. 时序标准化（Z-score + 分位数归一化）
-print("[INFO] Applying Z-score and quantile normalization...")
-# Z-score标准化
-df_z = (df[features] - df[features].mean()) / df[features].std()
-# 分位数归一化（clip到1%~99%）
-q_low = df_z.quantile(0.01)
-q_high = df_z.quantile(0.99)
-df_z = df_z.clip(q_low, q_high, axis=1)
-df[features] = df_z
+# 3. 评估指标函数
+def weighted_rmse(y_true, y_pred, weights):
+    """计算加权RMSE"""
+    return np.sqrt(np.mean(weights * (y_true - y_pred) ** 2))
 
-# 6. 设定标签
-target_col = 'responder_6'
+def directional_errors(y_true, y_pred):
+    """计算上行和下行误差"""
+    up_mask = y_true > 0
+    down_mask = y_true < 0
+    up_error = np.sqrt(np.mean((y_true[up_mask] - y_pred[up_mask]) ** 2))
+    down_error = np.sqrt(np.mean((y_true[down_mask] - y_pred[down_mask]) ** 2))
+    return up_error, down_error
 
-# 7. 只保留有标签的样本
-df = df[~df[target_col].isnull()]
+# 2. 加载和预处理数据
+X_train, X_valid, y_train, y_valid, features = load_and_preprocess_data(DATA_PATH, FEATURES_PATH)
 
-# 8. 特征重组（窗口切割+重塑为CNN输入）
-print("[INFO] Reshaping features for CNN input...")
-window_len = 60  # 每个样本的时间步长，可调整
-num_features = len(features)
-# 只保留能整除的部分
-total = (len(df) // window_len) * window_len
-X = df[features].values[:total].reshape(-1, window_len, num_features)
-y = df[target_col].values[:total].reshape(-1, window_len)
-noise = df['noise_label'].values[:total].reshape(-1, window_len)
-# 取每个窗口最后一个时间步的标签作为该窗口的标签
-y = y[:, -1]
-noise = noise[:, -1]
-# 增加通道维度，适配CNN输入
-X = X[..., np.newaxis]  # shape: (batch, window_len, num_features, 1)
+# 3. 实现三级加权机制
+train_weights = asymmetric_weight(y_train.values)
 
-# 9. 划分训练集和测试集
-X_train, X_test, y_train, y_test, noise_train, noise_test = train_test_split(
-    X, y, noise, test_size=0.2, random_state=42)
+# 4. 参数搜索空间
+param_dist = {
+    'n_estimators': [300, 400, 500],
+    'learning_rate': [0.01, 0.03, 0.05],
+    'max_depth': [4, 5, 6],
+    'subsample': [0.6, 0.7, 0.8],
+    'colsample_bytree': [0.6, 0.7, 0.8],
+    'gamma': [0, 0.1, 0.2],
+    'reg_alpha': [0.1, 0.5, 1.0],
+    'reg_lambda': [0.1, 0.5, 1.0],
+    'min_child_weight': [1, 3, 5]
+}
 
-# 10. 构建神经网络模型（多尺度CNN + SE注意力 + 双输出）
-def squeeze_excite_block(input_tensor, ratio=16):
-    """SE注意力模块"""
-    channels = input_tensor.shape[-1]
-    se = tf.keras.layers.GlobalAveragePooling2D()(input_tensor)
-    se = Dense(channels // ratio, activation='relu')(se)
-    se = Dense(channels, activation='sigmoid')(se)
-    se = tf.keras.layers.Reshape((1, 1, channels))(se)
-    return tf.keras.layers.Multiply()([input_tensor, se])
-
-# 主输入
-inputs = Input(shape=(window_len, num_features, 1))
-
-# 3x3 卷积分支
-x3 = tf.keras.layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
-x3 = tf.keras.layers.BatchNormalization()(x3)
-x3 = squeeze_excite_block(x3)  # 添加SE注意力
-
-# 7x7 卷积分支
-x7 = tf.keras.layers.Conv2D(32, (7, 7), activation='relu', padding='same')(inputs)
-x7 = tf.keras.layers.BatchNormalization()(x7)
-x7 = squeeze_excite_block(x7)  # 添加SE注意力
-
-# 特征融合
-x = tf.keras.layers.Concatenate()([x3, x7])
-x = tf.keras.layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-x = tf.keras.layers.BatchNormalization()(x)
-x = squeeze_excite_block(x)  # 融合后的特征再次通过SE注意力
-
-# 下采样
-x = tf.keras.layers.MaxPooling2D((2, 2))(x)
-
-# 共享特征提取
-shared_features = tf.keras.layers.GlobalAveragePooling2D()(x)
-shared_features = Dense(128, activation='relu')(shared_features)
-shared_features = Dropout(0.4)(shared_features)
-
-# 目标值预测分支
-target_branch = Dense(64, activation='relu')(shared_features)
-target_branch = Dropout(0.3)(target_branch)
-target_output = Dense(1, activation='linear', name='target_output')(target_branch)
-
-# 噪声预测分支
-noise_branch = Dense(64, activation='relu')(shared_features)
-noise_branch = Dropout(0.3)(noise_branch)
-noise_output = Dense(1, activation='sigmoid', name='noise_output')(noise_branch)
-
-# 构建模型
-model = Model(inputs, [target_output, noise_output])
-
-# 编译模型
-model.compile(
-    optimizer='adam',
-    loss={
-        'target_output': 'mse',
-        'noise_output': 'binary_crossentropy'
-    },
-    loss_weights={
-        'target_output': 1.0,
-        'noise_output': 0.3
-    },
-    metrics={
-        'target_output': ['mae', 'mse'],
-        'noise_output': 'accuracy'
-    }
+# 5. 初始化模型
+xgb_model = xgb.XGBRegressor(
+    objective='reg:squarederror',
+    random_state=42,
+    tree_method='gpu_hist',
+    predictor='gpu_predictor',
+    gpu_id=0,
+    early_stopping_rounds=20,
+    eval_metric=['rmse', 'mae']
 )
 
-model.summary()
+# 6. 随机搜索
+print("[INFO] Starting RandomizedSearchCV...")
+random_search = RandomizedSearchCV(
+    estimator=xgb_model,
+    param_distributions=param_dist,
+    n_iter=20,
+    scoring='neg_root_mean_squared_error',
+    cv=3,
+    verbose=2,
+    n_jobs=4
+)
 
-# 11. TensorBoard
-log_dir = "logs/" + datetime.now().strftime("%Y%m%d-%H%M%S")
-os.makedirs(log_dir, exist_ok=True)
-tensorboard_callback = TensorBoard(log_dir=log_dir, histogram_freq=1)
-
-# 12. 训练
-print("[INFO] Start training...")
+# 7. 训练模型
 start_time = time.time()
-history = model.fit(
-    X_train, {'target_output': y_train, 'noise_output': noise_train},
-    validation_data=(X_test, {'target_output': y_test, 'noise_output': noise_test}),
-    epochs=20,
-    batch_size=64,
-    callbacks=[EarlyStopping(patience=3, restore_best_weights=True), tensorboard_callback],
-    verbose=1
+random_search.fit(
+    X_train, y_train,
+    sample_weight=train_weights,
+    eval_set=[(X_valid, y_valid)],
+    verbose=True
 )
 end_time = time.time()
 print(f"⏱️ Training completed in {(end_time - start_time):.2f} seconds")
 
+# 8. 获取最佳模型
+best_model = random_search.best_estimator_
+print("\nBest parameters:", random_search.best_params_)
+print("Best RMSE:", -random_search.best_score_)
+
+# 9. 模型评估
+y_pred = best_model.predict(X_valid)
+
+# 计算各项评估指标
+rmse = np.sqrt(mean_squared_error(y_valid, y_pred))
+valid_weights = asymmetric_weight(y_valid.values)
+weighted_rmse_val = weighted_rmse(y_valid, y_pred, valid_weights)
+up_error, down_error = directional_errors(y_valid, y_pred)
+mae = mean_absolute_error(y_valid, y_pred)
+r2 = r2_score(y_valid, y_pred)
+
+print("\nModel Performance Metrics:")
+print(f"Standard RMSE: {rmse:.4f}")
+print(f"Weighted RMSE: {weighted_rmse_val:.4f}")
+print(f"Upside Error: {up_error:.4f}")
+print(f"Downside Error: {down_error:.4f}")
+print(f"MAE: {mae:.4f}")
+print(f"R2 Score: {r2:.4f}")
+
+# 10. 特征重要性分析
+feature_importance = pd.DataFrame({
+    'feature': features,
+    'importance': best_model.feature_importances_
+})
+feature_importance = feature_importance.sort_values('importance', ascending=False)
+
+plt.figure(figsize=(12, 6))
+sns.barplot(x='importance', y='feature', data=feature_importance.head(20))
+plt.title('Top 20 Feature Importance')
+plt.tight_layout()
+plt.savefig("feature_importance.png")
+plt.close()
+
+# 11. 预测结果可视化
+plt.figure(figsize=(10, 6))
+plt.scatter(y_valid, y_pred, alpha=0.3)
+plt.plot([y_valid.min(), y_valid.max()], [y_valid.min(), y_valid.max()], 'r--')
+plt.xlabel('True Values')
+plt.ylabel('Predictions')
+plt.title('True vs Predicted Values')
+plt.tight_layout()
+plt.savefig("prediction_scatter.png")
+plt.close()
+
+# 12. 残差分析
+residuals = y_valid - y_pred
+plt.figure(figsize=(10, 6))
+plt.scatter(y_pred, residuals, alpha=0.3)
+plt.axhline(y=0, color='r', linestyle='--')
+plt.xlabel('Predicted Values')
+plt.ylabel('Residuals')
+plt.title('Residual Plot')
+plt.tight_layout()
+plt.savefig("residual_plot.png")
+plt.close()
+
 # 13. 保存模型
-model.save("responder6_cnn_model.h5")
-model.save("responder6_cnn_saved_model")
-print("✅ Model saved successfully") 
+best_model.save_model("xgb_responder6_model.json")
+print("✅ Model saved successfully")
 
-# ========== 预测与可视化 ========== #
-import matplotlib
-matplotlib.use('Agg')  # 适配无GUI环境
-import matplotlib.pyplot as plt
-
-print("[INFO] Predicting on test set...")
-y_pred, noise_pred = model.predict(X_test)
-y_pred = y_pred.flatten()
-y_true = y_test.flatten()
-
-# 保存预测结果
+# 14. 保存预测结果
 results_df = pd.DataFrame({
-    'y_true': y_true,
-    'y_pred': y_pred
+    'y_true': y_valid,
+    'y_pred': y_pred,
+    'residuals': residuals
 })
 results_df.to_csv("prediction_results.csv", index=False)
-print("[INFO] Prediction results saved to prediction_results.csv")
-
-# 1. 真实值 vs 预测值
-plt.figure(figsize=(8, 6))
-plt.scatter(y_true, y_pred, alpha=0.3)
-plt.xlabel("True responder_6")
-plt.ylabel("Predicted responder_6")
-plt.title("True vs Predicted responder_6")
-plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
-plt.tight_layout()
-plt.savefig("scatter_true_vs_pred.png")
-plt.close()
-
-# 2. 残差分布
-errors = y_pred - y_true
-plt.figure(figsize=(8, 6))
-plt.hist(errors, bins=50, alpha=0.7)
-plt.xlabel("Prediction Error")
-plt.ylabel("Count")
-plt.title("Distribution of Prediction Errors")
-plt.tight_layout()
-plt.savefig("error_hist.png")
-plt.close()
-
-# 3. 局部时间序列对比
-plt.figure(figsize=(12, 6))
-plt.plot(y_true[:200], label="True")
-plt.plot(y_pred[:200], label="Predicted")
-plt.xlabel("Sample Index")
-plt.ylabel("responder_6")
-plt.title("True vs Predicted responder_6 (First 200 samples)")
-plt.legend()
-plt.tight_layout()
-plt.savefig("series_compare.png")
-plt.close()
-
-# 4. 残差 vs 真实值
-plt.figure(figsize=(8, 6))
-plt.scatter(y_true, errors, alpha=0.3)
-plt.xlabel("True responder_6")
-plt.ylabel("Residual (y_pred - y_true)")
-plt.title("Residuals vs True responder_6")
-plt.tight_layout()
-plt.savefig("residuals_vs_true.png")
-plt.close()
-
-# 5. 残差 vs 预测值
-plt.figure(figsize=(8, 6))
-plt.scatter(y_pred, errors, alpha=0.3)
-plt.xlabel("Predicted responder_6")
-plt.ylabel("Residual (y_pred - y_true)")
-plt.title("Residuals vs Predicted responder_6")
-plt.tight_layout()
-plt.savefig("residuals_vs_pred.png")
-plt.close()
-
-# 评估指标
-print("MSE:", mean_squared_error(y_true, y_pred))
-print("MAE:", mean_absolute_error(y_true, y_pred))
-print("R2 Score:", r2_score(y_true, y_pred)) 
-
-# 可视化训练过程
-print("[INFO] Visualizing training process...")
-
-# 1. 训练过程中的loss下降
-plt.figure(figsize=(12, 4))
-
-# 目标值预测的loss
-plt.subplot(1, 2, 1)
-plt.plot(history.history['target_output_loss'], label='Training Loss')
-plt.plot(history.history['val_target_output_loss'], label='Validation Loss')
-plt.title('Target Prediction Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-
-# 噪音预测的loss
-plt.subplot(1, 2, 2)
-plt.plot(history.history['noise_output_loss'], label='Training Loss')
-plt.plot(history.history['val_noise_output_loss'], label='Validation Loss')
-plt.title('Noise Prediction Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-
-plt.tight_layout()
-plt.savefig("training_loss.png")
-plt.close()
-
-# 2. 噪音预测效果
-plt.figure(figsize=(12, 4))
-
-# 噪音预测的准确率
-plt.subplot(1, 2, 1)
-plt.plot(history.history['noise_output_accuracy'], label='Training Accuracy')
-plt.plot(history.history['val_noise_output_accuracy'], label='Validation Accuracy')
-plt.title('Noise Prediction Accuracy')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.legend()
-
-# 噪音预测的混淆矩阵
-plt.subplot(1, 2, 2)
-noise_pred_binary = (noise_pred > 0.5).astype(int)
-noise_true = noise_test.flatten()
-plt.scatter(noise_true, noise_pred.flatten(), alpha=0.3)
-plt.xlabel('True Noise Label')
-plt.ylabel('Predicted Noise Probability')
-plt.title('Noise Prediction Distribution')
-plt.plot([0, 1], [0.5, 0.5], 'r--', label='Decision Boundary')
-plt.legend()
-
-plt.tight_layout()
-plt.savefig("noise_prediction.png")
-plt.close()
-
-# 3. 目标值预测的MAE和MSE
-plt.figure(figsize=(12, 4))
-
-# MAE
-plt.subplot(1, 2, 1)
-plt.plot(history.history['target_output_mae'], label='Training MAE')
-plt.plot(history.history['val_target_output_mae'], label='Validation MAE')
-plt.title('Target Prediction MAE')
-plt.xlabel('Epoch')
-plt.ylabel('MAE')
-plt.legend()
-
-# MSE
-plt.subplot(1, 2, 2)
-plt.plot(history.history['target_output_mse'], label='Training MSE')
-plt.plot(history.history['val_target_output_mse'], label='Validation MSE')
-plt.title('Target Prediction MSE')
-plt.xlabel('Epoch')
-plt.ylabel('MSE')
-plt.legend()
-
-plt.tight_layout()
-plt.savefig("target_metrics.png")
-plt.close()
-
-print("✅ Training visualization completed") 
+print("✅ Prediction results saved to prediction_results.csv") 
